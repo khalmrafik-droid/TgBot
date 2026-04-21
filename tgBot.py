@@ -136,7 +136,7 @@ async def ask_deepseek(user_message: str, conversation_history: list) -> str:
     messages.extend(conversation_history)
     messages.append({"role": "user", "content": user_message})
     
-    try:
+      try:
         response = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={
@@ -146,7 +146,7 @@ async def ask_deepseek(user_message: str, conversation_history: list) -> str:
                 "X-Title": "Tarot Bot"
             },
             json={
-                "model": "deepseek/deepseek-r1:free",
+                "model": "google/gemini-2.0-flash-lite-preview-02-05:free",  # ← новая модель
                 "messages": messages,
                 "temperature": 0.8,
                 "max_tokens": 1500
