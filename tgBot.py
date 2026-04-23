@@ -1,32 +1,24 @@
-import os
-import json
 import logging
 import sqlite3
+import requests
 from datetime import datetime, timedelta
-import google.generativeai as genai
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, 
+    Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, PreCheckoutQueryHandler,
     filters, ContextTypes
 )
 
 # ========== НАСТРОЙКИ ==========
 TELEGRAM_TOKEN = "8734467499:AAH6fiS95Vi4XCvodNwH8nWI-e0FKB8Hupk"
+DEEPSEEK_API_KEY = "sk-твой_ключ_deepseek"  # СЮДА ВСТАВЬ СВОЙ КЛЮЧ
 
-# API ключ Gemini (получил на aistudio.google.com)
-GEMINI_API_KEY = "AIzaSyDIM7bUaWR5OI9hnZRnPlyeB9m-4G1BfG0"
-
-# Настройка Gemini
-genai.configure(api_key=GEMINI_API_KEY)
-
-# Цены (в рублях и в Telegram Stars)
 PRICE_PER_READING = 50
 SUBSCRIPTION_PRICE = 300
 STARS_PER_READING = 25
 STARS_SUBSCRIPTION = 150
 
-# Системный промпт для таролога (теперь передаётся в Gemini)
+# Системный промпт для таролога
 TAROT_SYSTEM_PROMPT = """
 Ты — опытный таролог, работающий с классической колодой Райдера‑Уэйта.
 
@@ -35,14 +27,13 @@ TAROT_SYSTEM_PROMPT = """
 2. Всегда называй конкретные карты (например, «Восьмёрка Кубков», «Башня», «Солнце»).
 3. Говори честно, но без жестокости.
 4. В конце каждого ответа давай короткий совет.
-5. Если вопрос неясный — вытягивай карту «Уточнение».
-6. Стиль — спокойный, чуть мистический, без пафоса.
-7. Отвечай на русском языке.
+5. Стиль — спокойный, чуть мистический, без пафоса.
+6. Отвечай на русском языке.
 """
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# ========== РАБОТА С БАЗОЙ ДАННЫХ ==========
+# ========== БАЗА ДАННЫХ ==========
 def init_db():
     conn = sqlite3.connect('tarot_bot.db')
     c = conn.cursor()
@@ -137,42 +128,40 @@ def can_do_reading(user_id):
         return True, "free"
     return False, "limited"
 
-# ========== ФУНКЦИЯ ЗАПРОСА К GEMINI ==========
-async def ask_gemini(user_message: str, conversation_history: list) -> str:
-    """Отправляет запрос к Google Gemini API с историей диалога"""
+# ========== ЗАПРОС К DEEPSEEK API ==========
+async def ask_deepseek(user_message: str, conversation_history: list) -> str:
+    """Отправляет запрос к DeepSeek API и возвращает ответ таролога"""
     
-    # Формируем полный промпт: системный + история + новый вопрос
-    full_prompt = TAROT_SYSTEM_PROMPT + "\n\n"
-    
-    # Добавляем историю диалога (последние 10 сообщений)
-    if conversation_history:
-        for msg in conversation_history[-10:]:  # берём последние 10 сообщений для контекста
-            role = "Пользователь" if msg["role"] == "user" else "Таролог"
-            full_prompt += f"{role}: {msg['content']}\n"
-    
-    full_prompt += f"\nПользователь: {user_message}\n\nТаролог:"
+    messages = [
+        {"role": "system", "content": TAROT_SYSTEM_PROMPT}
+    ]
+    messages.extend(conversation_history)
+    messages.append({"role": "user", "content": user_message})
     
     try:
-        # Используем бесплатную модель Gemini 1.5 Flash
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        
-        # Генерируем ответ
-        response = model.generate_content(
-            full_prompt,
-            generation_config={
+        response = requests.post(
+            "https://api.deepseek.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "deepseek-chat",
+                "messages": messages,
                 "temperature": 0.8,
-                "max_output_tokens": 1500,
-                "top_p": 0.95
-            }
+                "max_tokens": 1500
+            },
+            timeout=30
         )
         
-        if response.text:
-            return response.text
+        if response.status_code == 200:
+            return response.json()["choices"][0]["message"]["content"]
         else:
-            return "🔮 *Карты молчат...* Попробуй задать вопрос иначе."
+            logging.error(f"DeepSeek API error: {response.status_code} - {response.text}")
+            return "🔮 *Карты молчат...* Ошибка соединения. Попробуй позже."
     
     except Exception as e:
-        logging.error(f"Gemini API error: {e}")
+        logging.error(f"Request error: {e}")
         return "⚠️ Связь с оракулом временно прервалась. Попробуй через минуту."
 
 # ========== КЛАВИАТУРЫ ДЛЯ ОПЛАТЫ ==========
@@ -191,7 +180,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     remaining = 3 - user["free_readings_used"]
     subscription_active = has_active_subscription(user_id)
     
-    status_text = ""
     if subscription_active:
         status_text = "✅ *У вас активна подписка* — неограниченные расклады!"
     else:
@@ -220,9 +208,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if subscription_active:
         await update.message.reply_text(
-            "✅ *У вас активна подписка!*\n\n"
-            "Вы можете делать неограниченное количество раскладов.\n"
-            "Просто задавай вопросы — я отвечу.",
+            "✅ *У вас активна подписка!*\n\nВы можете делать неограниченное количество раскладов.",
             parse_mode="Markdown"
         )
     else:
@@ -257,8 +243,6 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
-    user_id = update.effective_user.id
     data = query.data
     
     if data == "cancel_payment":
@@ -290,8 +274,7 @@ async def payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.pre_checkout_query
-    await query.answer(ok=True)
+    await update.pre_checkout_query.answer(ok=True)
 
 async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -305,18 +288,16 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "Ты купил 1 расклад. Напиши свой вопрос — и я сразу вытяну карты.",
             parse_mode="Markdown"
         )
-    
     elif payment.invoice_payload.startswith("subscription"):
         activate_subscription(user_id, 1)
         log_payment(user_id, SUBSCRIPTION_PRICE, "subscription")
         await update.message.reply_text(
             "🌟 *Подписка активирована!*\n\n"
-            "Теперь у тебя безлимитные расклады на 30 дней.\n"
-            "Задавай любые вопросы — я всегда рядом.",
+            "Теперь у тебя безлимитные расклады на 30 дней.",
             parse_mode="Markdown"
         )
 
-# ========== ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ ==========
+# ========== ОСНОВНОЙ ОБРАБОТЧИК ==========
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
     user_id = update.effective_user.id
@@ -327,7 +308,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not can_do and not paid_available:
         await update.message.reply_text(
             "🔮 *Лимит бесплатных раскладов исчерпан.*\n\n"
-            "Ты использовал все 3 бесплатных расклада.\n\n"
             "Чтобы продолжить:\n"
             "• 50 ₽ за расклад\n"
             "• 300 ₽ за безлимит на месяц\n\n"
@@ -342,8 +322,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     
-    # Используем Gemini вместо DeepSeek
-    answer = await ask_gemini(user_message, history)
+    answer = await ask_deepseek(user_message, history)
     
     history.append({"role": "user", "content": user_message})
     history.append({"role": "assistant", "content": answer})
@@ -358,9 +337,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
     elif reason == "free":
-        user = get_user(user_id)
-        remaining = 2 - user["free_readings_used"]
         update_user_readings(user_id)
+        remaining = 2 - get_user(user_id)["free_readings_used"]
         await update.message.reply_text(
             f"{answer}\n\n---\n📊 *Бесплатных раскладов осталось:* {remaining} из 3\nКупить подписку — /subscribe",
             parse_mode="Markdown"
@@ -376,12 +354,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     init_db()
     
-    if TELEGRAM_TOKEN == "7123456789:AAEпримерныйтокен_который_дал_BotFather":
+    if TELEGRAM_TOKEN == "ТВОЙ_ТОКЕН_ОТ_BOTFATHER":
         print("❌ ОШИБКА: Замени TELEGRAM_TOKEN на реальный токен от @BotFather")
         return
     
-    if GEMINI_API_KEY == "AIzaSyD3fG5hJkL9mNpQrStUvWxYz1234567890":
-        print("❌ ОШИБКА: Замени GEMINI_API_KEY на реальный ключ с aistudio.google.com")
+    if DEEPSEEK_API_KEY == "sk-твой_ключ_deepseek":
+        print("❌ ОШИБКА: Замени DEEPSEEK_API_KEY на ключ с platform.deepseek.com")
         return
     
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -395,7 +373,7 @@ def main():
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    print("🔮 Бот-таролог с Gemini API запущен...")
+    print("🔮 Бот-таролог с DeepSeek API запущен...")
     app.run_polling()
 
 if __name__ == "__main__":
