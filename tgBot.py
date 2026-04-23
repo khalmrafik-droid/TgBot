@@ -11,7 +11,7 @@ from telegram.ext import (
 
 # ========== НАСТРОЙКИ ==========
 TELEGRAM_TOKEN = "8734467499:AAH6fiS95Vi4XCvodNwH8nWI-e0FKB8Hupk"
-DEEPSEEK_API_KEY = "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"  # СЮДА ВСТАВЬ СВОЙ КЛЮЧ
+DEEPSEEK_API_KEY = "sk-551b3f8e8bab4848b0cc8712ada432c0"  # СЮДА ВСТАВЬ СВОЙ КЛЮЧ
 
 PRICE_PER_READING = 50
 SUBSCRIPTION_PRICE = 300
