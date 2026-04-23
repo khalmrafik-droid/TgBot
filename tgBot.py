@@ -1,45 +1,48 @@
-"""
-Telegram бот-таролог для BotHost.ru
-API-ключи берутся из переменных окружения:
-- TELEGRAM_TOKEN
-- OPENROUTER_API_KEY
-"""
-
 import os
 import json
 import logging
 import sqlite3
 from datetime import datetime, timedelta
-import requests
+import google.generativeai as genai
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
+    Application, CommandHandler, MessageHandler, 
     CallbackQueryHandler, PreCheckoutQueryHandler,
     filters, ContextTypes
 )
 
-# ========== ЗАГРУЗКА КЛЮЧЕЙ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ==========
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "НЕ_УСТАНОВЛЕН")
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "НЕ_УСТАНОВЛЕН")
-
 # ========== НАСТРОЙКИ ==========
+TELEGRAM_TOKEN = "8734467499:AAH6fiS95Vi4XCvodNwH8nWI-e0FKB8Hupk"
+
+# API ключ Gemini (получил на aistudio.google.com)
+GEMINI_API_KEY = "AIzaSyDIM7bUaWR5OI9hnZRnPlyeB9m-4G1BfG0"
+
+# Настройка Gemini
+genai.configure(api_key=GEMINI_API_KEY)
+
+# Цены (в рублях и в Telegram Stars)
 PRICE_PER_READING = 50
 SUBSCRIPTION_PRICE = 300
 STARS_PER_READING = 25
 STARS_SUBSCRIPTION = 150
 
-SYSTEM_PROMPT = """Ты — опытный таролог, работающий с классической колодой Райдера‑Уэйта.
+# Системный промпт для таролога (теперь передаётся в Gemini)
+TAROT_SYSTEM_PROMPT = """
+Ты — опытный таролог, работающий с классической колодой Райдера‑Уэйта.
 
 Правила:
 1. Перед каждым ответом описывай процесс: «тасую колоду», «вытягиваю карту».
 2. Всегда называй конкретные карты (например, «Восьмёрка Кубков», «Башня», «Солнце»).
 3. Говори честно, но без жестокости.
 4. В конце каждого ответа давай короткий совет.
-5. Стиль — спокойный, чуть мистический, без пафоса."""
+5. Если вопрос неясный — вытягивай карту «Уточнение».
+6. Стиль — спокойный, чуть мистический, без пафоса.
+7. Отвечай на русском языке.
+"""
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# ========== БАЗА ДАННЫХ ==========
+# ========== РАБОТА С БАЗОЙ ДАННЫХ ==========
 def init_db():
     conn = sqlite3.connect('tarot_bot.db')
     c = conn.cursor()
@@ -65,6 +68,7 @@ def get_user(user_id):
     c.execute("SELECT free_readings_used, subscription_end, total_readings FROM users WHERE user_id = ?", (user_id,))
     row = c.fetchone()
     conn.close()
+    
     if row:
         return {
             "free_readings_used": row[0],
@@ -92,6 +96,7 @@ def has_active_subscription(user_id):
     c.execute("SELECT subscription_end FROM users WHERE user_id = ?", (user_id,))
     row = c.fetchone()
     conn.close()
+    
     if row and row[0]:
         end_date = datetime.fromisoformat(row[0])
         return end_date > datetime.now()
@@ -102,6 +107,7 @@ def activate_subscription(user_id, months=1):
     c = conn.cursor()
     c.execute("SELECT subscription_end FROM users WHERE user_id = ?", (user_id,))
     row = c.fetchone()
+    
     if row and row[0]:
         current_end = datetime.fromisoformat(row[0])
         if current_end > datetime.now():
@@ -110,6 +116,7 @@ def activate_subscription(user_id, months=1):
             new_end = datetime.now() + timedelta(days=30 * months)
     else:
         new_end = datetime.now() + timedelta(days=30 * months)
+    
     c.execute("UPDATE users SET subscription_end = ? WHERE user_id = ?", (new_end.isoformat(), user_id))
     conn.commit()
     conn.close()
@@ -130,36 +137,52 @@ def can_do_reading(user_id):
         return True, "free"
     return False, "limited"
 
-# ========== ЗАПРОС К OPENROUTER ==========
-async def ask_deepseek(user_message: str, conversation_history: list) -> str:
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages.extend(conversation_history)
-    messages.append({"role": "user", "content": user_message})
+# ========== ФУНКЦИЯ ЗАПРОСА К GEMINI ==========
+async def ask_gemini(user_message: str, conversation_history: list) -> str:
+    """Отправляет запрос к Google Gemini API с историей диалога"""
+    
+    # Формируем полный промпт: системный + история + новый вопрос
+    full_prompt = TAROT_SYSTEM_PROMPT + "\n\n"
+    
+    # Добавляем историю диалога (последние 10 сообщений)
+    if conversation_history:
+        for msg in conversation_history[-10:]:  # берём последние 10 сообщений для контекста
+            role = "Пользователь" if msg["role"] == "user" else "Таролог"
+            full_prompt += f"{role}: {msg['content']}\n"
+    
+    full_prompt += f"\nПользователь: {user_message}\n\nТаролог:"
     
     try:
-        response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://t.me/tarot_bot",
-                "X-Title": "Tarot Bot"
-            },
-            json={
-                "model": "google/gemini-2.0-flash-lite-preview-02-05:free",
-                "messages": messages,
+        # Используем бесплатную модель Gemini 1.5 Flash
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        # Генерируем ответ
+        response = model.generate_content(
+            full_prompt,
+            generation_config={
                 "temperature": 0.8,
-                "max_tokens": 1500
-            },
-            timeout=60
+                "max_output_tokens": 1500,
+                "top_p": 0.95
+            }
         )
         
-        if response.status_code == 200:
-            return response.json()["choices"][0]["message"]["content"]
+        if response.text:
+            return response.text
         else:
-            return f"🔮 Ошибка OpenRouter: {response.status_code}\n{response.text[:200]}"
+            return "🔮 *Карты молчат...* Попробуй задать вопрос иначе."
+    
     except Exception as e:
-        return f"⚠️ Ошибка: {str(e)[:100]}"
+        logging.error(f"Gemini API error: {e}")
+        return "⚠️ Связь с оракулом временно прервалась. Попробуй через минуту."
+
+# ========== КЛАВИАТУРЫ ДЛЯ ОПЛАТЫ ==========
+def get_payment_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("💰 1 расклад — 50 ₽ (Telegram Stars)", callback_data="pay_star_reading")],
+        [InlineKeyboardButton("🌟 Подписка на месяц — 300 ₽ (Telegram Stars)", callback_data="pay_star_subscription")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_payment")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 # ========== КОМАНДЫ БОТА ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -167,9 +190,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(user_id)
     remaining = 3 - user["free_readings_used"]
     subscription_active = has_active_subscription(user_id)
-    status_text = "✅ *У вас активна подписка* — неограниченные расклады!" if subscription_active else f"📊 *Бесплатных раскладов осталось:* {remaining} из 3"
+    
+    status_text = ""
+    if subscription_active:
+        status_text = "✅ *У вас активна подписка* — неограниченные расклады!"
+    else:
+        status_text = f"📊 *Бесплатных раскладов осталось:* {remaining} из 3"
+    
     await update.message.reply_text(
-        f"🔮 *Привет, я твой личный таролог!*\n\n{status_text}\n\nПросто задай вопрос — и я вытяну карты.\n\nПосле 3 бесплатных раскладов:\n• 50 ₽ за расклад\n• 300 ₽ за безлимит на месяц\n\nКоманды:\n/start — это сообщение\n/status — проверить остаток\n/subscribe — купить подписку\n/clear — очистить историю",
+        f"🔮 *Привет, я твой личный таролог!*\n\n"
+        f"{status_text}\n\n"
+        f"Просто задай вопрос — и я вытяну карты.\n\n"
+        f"После 3 бесплатных раскладов:\n"
+        f"• 50 ₽ за расклад\n"
+        f"• 300 ₽ за безлимит на месяц\n\n"
+        f"Команды:\n"
+        f"/start — это сообщение\n"
+        f"/status — проверить остаток\n"
+        f"/subscribe — купить подписку\n"
+        f"/clear — очистить историю",
         parse_mode="Markdown"
     )
 
@@ -178,61 +217,123 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(user_id)
     remaining = 3 - user["free_readings_used"]
     subscription_active = has_active_subscription(user_id)
+    
     if subscription_active:
-        await update.message.reply_text("✅ *У вас активна подписка!*\n\nВы можете делать неограниченное количество раскладов.", parse_mode="Markdown")
+        await update.message.reply_text(
+            "✅ *У вас активна подписка!*\n\n"
+            "Вы можете делать неограниченное количество раскладов.\n"
+            "Просто задавай вопросы — я отвечу.",
+            parse_mode="Markdown"
+        )
     else:
-        await update.message.reply_text(f"📊 *Ваш статус:*\n\nБесплатных раскладов использовано: {user['free_readings_used']} из 3\nОсталось: {remaining}\nВсего раскладов: {user['total_readings']}\n\nЧтобы купить подписку — /subscribe", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"📊 *Ваш статус:*\n\n"
+            f"Бесплатных раскладов использовано: {user['free_readings_used']} из 3\n"
+            f"Осталось: {remaining}\n"
+            f"Всего раскладов: {user['total_readings']}\n\n"
+            f"Чтобы купить подписку — /subscribe",
+            parse_mode="Markdown"
+        )
 
 async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("💰 1 расклад — 50 ₽ (Telegram Stars)", callback_data="pay_star_reading")],
-        [InlineKeyboardButton("🌟 Подписка на месяц — 300 ₽ (Telegram Stars)", callback_data="pay_star_subscription")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_payment")]
-    ]
-    await update.message.reply_text("🌟 *Варианты оплаты:*\n\n• 50 ₽ — 1 расклад\n• 300 ₽ — безлимит на месяц\n\nВыбери вариант:", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text(
+        "🌟 *Варианты оплаты:*\n\n"
+        "• 50 ₽ — 1 расклад (через Telegram Stars)\n"
+        "• 300 ₽ — безлимит на месяц (через Telegram Stars)\n\n"
+        "Telegram Stars — внутренняя валюта Telegram.\n\n"
+        "Выбери вариант:",
+        parse_mode="Markdown",
+        reply_markup=get_payment_keyboard()
+    )
 
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["history"] = []
-    await update.message.reply_text("✨ *История раскладов очищена.* Начинаем новый сеанс.", parse_mode="Markdown")
+    await update.message.reply_text(
+        "✨ *История раскладов очищена.* Начинаем новый сеанс.",
+        parse_mode="Markdown"
+    )
 
+# ========== ОБРАБОТКА ПЛАТЕЖЕЙ ==========
 async def payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    
+    user_id = update.effective_user.id
     data = query.data
+    
     if data == "cancel_payment":
-        await query.edit_message_text("❌ Оплата отменена.")
+        await query.edit_message_text("❌ Оплата отменена. Если передумаешь — /subscribe")
         return
+    
     if data == "pay_star_reading":
-        title, description, amount, payload = "🔮 Расклад Таро", "Один полный расклад карт Таро", STARS_PER_READING, "reading_1"
+        title = "🔮 Расклад Таро"
+        description = "Один полный расклад карт Таро с ответом на твой вопрос"
+        amount = STARS_PER_READING
+        payload = "reading_1"
     elif data == "pay_star_subscription":
-        title, description, amount, payload = "🌟 Подписка на месяц Таро", "Безлимитные расклады на 30 дней", STARS_SUBSCRIPTION, "subscription_1month"
+        title = "🌟 Подписка на месяц Таро"
+        description = "Безлимитные расклады на 30 дней"
+        amount = STARS_SUBSCRIPTION
+        payload = "subscription_1month"
     else:
         return
-    await context.bot.send_invoice(chat_id=update.effective_chat.id, title=title, description=description, payload=payload, provider_token="", currency="XTR", prices=[LabeledPrice("Оплата", amount)], start_parameter="tarot_payment")
+    
+    await context.bot.send_invoice(
+        chat_id=update.effective_chat.id,
+        title=title,
+        description=description,
+        payload=payload,
+        provider_token="",
+        currency="XTR",
+        prices=[LabeledPrice("Оплата", amount)],
+        start_parameter="tarot_payment"
+    )
 
 async def pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.pre_checkout_query.answer(ok=True)
+    query = update.pre_checkout_query
+    await query.answer(ok=True)
 
 async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     payment = update.message.successful_payment
+    
     if payment.invoice_payload.startswith("reading"):
         context.user_data["paid_reading_available"] = True
         log_payment(user_id, PRICE_PER_READING, "single")
-        await update.message.reply_text("✅ *Оплата прошла успешно!*\n\nТы купил 1 расклад. Напиши свой вопрос.", parse_mode="Markdown")
+        await update.message.reply_text(
+            "✅ *Оплата прошла успешно!*\n\n"
+            "Ты купил 1 расклад. Напиши свой вопрос — и я сразу вытяну карты.",
+            parse_mode="Markdown"
+        )
+    
     elif payment.invoice_payload.startswith("subscription"):
         activate_subscription(user_id, 1)
         log_payment(user_id, SUBSCRIPTION_PRICE, "subscription")
-        await update.message.reply_text("🌟 *Подписка активирована!*\n\nТеперь у тебя безлимитные расклады на 30 дней.", parse_mode="Markdown")
+        await update.message.reply_text(
+            "🌟 *Подписка активирована!*\n\n"
+            "Теперь у тебя безлимитные расклады на 30 дней.\n"
+            "Задавай любые вопросы — я всегда рядом.",
+            parse_mode="Markdown"
+        )
 
+# ========== ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ ==========
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
     user_id = update.effective_user.id
+    
     paid_available = context.user_data.get("paid_reading_available", False)
     can_do, reason = can_do_reading(user_id)
     
     if not can_do and not paid_available:
-        await update.message.reply_text("🔮 *Лимит бесплатных раскладов исчерпан.*\n\nНапиши /subscribe — выбери вариант оплаты.", parse_mode="Markdown")
+        await update.message.reply_text(
+            "🔮 *Лимит бесплатных раскладов исчерпан.*\n\n"
+            "Ты использовал все 3 бесплатных расклада.\n\n"
+            "Чтобы продолжить:\n"
+            "• 50 ₽ за расклад\n"
+            "• 300 ₽ за безлимит на месяц\n\n"
+            "Напиши /subscribe — выбери вариант оплаты.",
+            parse_mode="Markdown"
+        )
         return
     
     if "history" not in context.user_data:
@@ -240,7 +341,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history = context.user_data["history"]
     
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    answer = await ask_deepseek(user_message, history)
+    
+    # Используем Gemini вместо DeepSeek
+    answer = await ask_gemini(user_message, history)
     
     history.append({"role": "user", "content": user_message})
     history.append({"role": "assistant", "content": answer})
@@ -250,35 +353,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if paid_available:
         context.user_data["paid_reading_available"] = False
-        await update.message.reply_text(f"{answer}\n\n---\n💎 *Использован оплаченный расклад.*", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"{answer}\n\n---\n💎 *Использован оплаченный расклад.*\nКупить ещё — /subscribe",
+            parse_mode="Markdown"
+        )
     elif reason == "free":
         user = get_user(user_id)
         remaining = 2 - user["free_readings_used"]
         update_user_readings(user_id)
-        await update.message.reply_text(f"{answer}\n\n---\n📊 *Бесплатных раскладов осталось:* {remaining} из 3", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"{answer}\n\n---\n📊 *Бесплатных раскладов осталось:* {remaining} из 3\nКупить подписку — /subscribe",
+            parse_mode="Markdown"
+        )
     else:
         update_user_readings(user_id)
-        await update.message.reply_text(f"{answer}\n\n---\n🌟 *Подписка активна* — задавай следующий вопрос!", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"{answer}\n\n---\n🌟 *Подписка активна* — задавай следующий вопрос!",
+            parse_mode="Markdown"
+        )
 
-# ========== ЗАПУСК БОТА ==========
+# ========== ЗАПУСК ==========
 def main():
     init_db()
     
-    # Проверка наличия ключей
-    if TELEGRAM_TOKEN == "НЕ_УСТАНОВЛЕН":
-        print("❌ ОШИБКА: Переменная TELEGRAM_TOKEN не установлена!")
-        print("   Добавь её в переменные окружения на BotHost.ru")
+    if TELEGRAM_TOKEN == "7123456789:AAEпримерныйтокен_который_дал_BotFather":
+        print("❌ ОШИБКА: Замени TELEGRAM_TOKEN на реальный токен от @BotFather")
         return
     
-    if OPENROUTER_API_KEY == "НЕ_УСТАНОВЛЕН":
-        print("❌ ОШИБКА: Переменная OPENROUTER_API_KEY не установлена!")
-        print("   Добавь её в переменные окружения на BotHost.ru")
+    if GEMINI_API_KEY == "AIzaSyD3fG5hJkL9mNpQrStUvWxYz1234567890":
+        print("❌ ОШИБКА: Замени GEMINI_API_KEY на реальный ключ с aistudio.google.com")
         return
     
-    # Создаём приложение
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Добавляем обработчики
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("subscribe", subscribe_command))
@@ -288,7 +395,7 @@ def main():
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    print("🔮 Бот-таролог запущен на BotHost.ru!")
+    print("🔮 Бот-таролог с Gemini API запущен...")
     app.run_polling()
 
 if __name__ == "__main__":
